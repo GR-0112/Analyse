@@ -1,94 +1,119 @@
 const fs = require('fs');
-const cheerio = require('cheerio');
+const http = require('http');
 const https = require('https');
+const { URL } = require('url');
 
-// Enkel fetch-funksjon som ikke bruker node-fetch/undici
-function fetchHTML(url) {
-  return new Promise((resolve, reject) => {
-    const doRequest = (u, redirects = 0) => {
-      https
-        .get(u, (res) => {
-          // Håndter enkle redirects (301/302)
-          if (
-            res.statusCode >= 300 &&
-            res.statusCode < 400 &&
-            res.headers.location &&
-            redirects < 3
-          ) {
-            const next = res.headers.location.startsWith('http')
-              ? res.headers.location
-              : new URL(res.headers.location, u).toString();
-            return doRequest(next, redirects + 1);
-          }
+const targetUrl = process.env.TARGET_URL;
 
-          let data = '';
-          res.on('data', (chunk) => {
-            data += chunk;
-          });
-          res.on('end', () => resolve(data));
-        })
-        .on('error', (err) => reject(err));
-    };
-
-    doRequest(url);
-  });
-}
-
-const url = process.env.TARGET_URL;
-
-if (!url) {
+if (!targetUrl) {
   console.error('TARGET_URL mangler');
   process.exit(1);
 }
 
-(async () => {
-  try {
-    console.log('Henter HTML fra:', url);
+/**
+ * Hent HTML uten eksterne pakker (bruker kun http/https)
+ */
+function fetchHTML(urlStr, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) {
+      return reject(new Error('For mange redirects'));
+    }
 
-    const html = await fetchHTML(url);
-    const $ = cheerio.load(html);
+    let url;
+    try {
+      url = new URL(urlStr);
+    } catch (e) {
+      return reject(new Error('Ugyldig URL'));
+    }
 
-    // ===== 1. Enkle indikatorer =====
-    const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
-    const textLength = bodyText.length;
+    const lib = url.protocol === 'https:' ? https : http;
 
-    const headingsText = $('h1, h2, h3').text().toLowerCase();
+    const req = lib.get(url, (res) => {
+      // Håndter 301/302 osv.
+      if (
+        res.statusCode >= 300 &&
+        res.statusCode < 400 &&
+        res.headers.location
+      ) {
+        const next = res.headers.location.startsWith('http')
+          ? res.headers.location
+          : new URL(res.headers.location, urlStr).toString();
+        res.resume();
+        return resolve(fetchHTML(next, redirects + 1));
+      }
 
-    const hasServiceWords =
-      headingsText.includes('tjenester') ||
-      headingsText.includes('produkter') ||
-      headingsText.includes('vi tilbyr');
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve(data));
+    });
 
-    const hasFAQ =
-      $('details, summary').length > 0 ||
-      $('.faq, .accordion').length > 0 ||
-      /faq|ofte stilte spørsmål/i.test(headingsText);
+    req.on('error', (err) => reject(err));
+    req.end();
+  });
+}
 
-    const hasSchema = $('script[type="application/ld+json"]').length > 0;
+/**
+ * Enkel HTML-analyse uten cheerio.
+ * Vi bruker enkle mønstre for å få nok signaler til salgsrapporten.
+ */
+function analyseHtml(html) {
+  const noScripts = html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '');
 
-    const veryLowText = textLength < 1500;
+  const textOnly = noScripts.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+  const textLength = textOnly.trim().length;
 
-    // ===== 2. Enkle scorer =====
-    let seoScore = 70;
-    if (textLength < 3000) seoScore -= 10;
-    if (!hasServiceWords) seoScore -= 10;
-    if (!hasSchema) seoScore -= 10;
+  // overskrifter
+  const headingMatches = noScripts.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/gi) || [];
+  const headingsText = headingMatches
+    .map((h) => h.replace(/<[^>]+>/g, ' '))
+    .join(' ')
+    .toLowerCase();
 
-    let aiScore = 70;
-    if (!hasFAQ) aiScore -= 20;
-    if (!hasSchema) aiScore -= 10;
-    if (textLength < 3000) aiScore -= 10;
+  const hasServiceWords =
+    headingsText.includes('tjenester') ||
+    headingsText.includes('produkter') ||
+    headingsText.includes('vi tilbyr') ||
+    headingsText.includes('våre tjenester');
 
-    let uuScore = 75;
-    if (veryLowText) uuScore -= 10; // lite forklarende tekst
+  const hasFAQ =
+    /faq|ofte stilte spørsmål/.test(noScripts.toLowerCase()) ||
+    /<details[^>]*>[\s\S]*?<summary[^>]*>/i.test(noScripts);
 
-    // Begrens scorer mellom 0 og 100
-    seoScore = Math.max(0, Math.min(100, seoScore));
-    aiScore = Math.max(0, Math.min(100, aiScore));
-    uuScore = Math.max(0, Math.min(100, uuScore));
+  const hasSchema =
+    /type=['"]application\/ld\+json['"]/.test(noScripts.toLowerCase());
 
-    // ===== 3. Bygg selger-rapport =====
-    const rapport = `
+  const veryLowText = textLength < 1500;
+
+  // ===== Scorer (enkle regler, 0–100) =====
+  let seoScore = 70;
+  if (textLength < 3000) seoScore -= 10;
+  if (!hasServiceWords) seoScore -= 10;
+  if (!hasSchema) seoScore -= 10;
+
+  let aiScore = 70;
+  if (!hasFAQ) aiScore -= 20;
+  if (!hasSchema) aiScore -= 10;
+  if (textLength < 3000) aiScore -= 10;
+
+  let uuScore = 75;
+  if (veryLowText) uuScore -= 10;
+
+  seoScore = Math.max(0, Math.min(100, seoScore));
+  aiScore = Math.max(0, Math.min(100, aiScore));
+  uuScore = Math.max(0, Math.min(100, uuScore));
+
+  return { seoScore, aiScore, uuScore };
+}
+
+/**
+ * Bygg rapporttekst
+ */
+function buildReport(url, scores) {
+  const { seoScore, aiScore, uuScore } = scores;
+
+  return `
 Konkurrentanalyse – Kort vurdering
 Nettside: ${url}
 
@@ -133,8 +158,19 @@ Kort fortalt:
 Konkurrenten ser grei ut, men Google forstår dem ikke, AI finner dem ikke,
 og mange kunder overser viktig informasjon. Dere kan lett gjøre dette bedre.
 `.trim() + '\n';
+}
 
-    fs.writeFileSync('SALGS-RAPPORT.txt', rapport, 'utf8');
+/**
+ * Main
+ */
+(async () => {
+  try {
+    console.log('Henter HTML fra:', targetUrl);
+    const html = await fetchHTML(targetUrl);
+    const scores = analyseHtml(html);
+    const report = buildReport(targetUrl, scores);
+
+    fs.writeFileSync('SALGS-RAPPORT.txt', report, 'utf8');
     console.log('SALGS-RAPPORT.txt generert ✅');
   } catch (err) {
     console.error('Feil under kjøring av agent:', err);
