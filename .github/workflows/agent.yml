@@ -20,11 +20,6 @@ jobs:
         with:
           node-version: 18
 
-      - name: Installer nødvendige pakker
-        run: |
-          npm init -y
-          npm install cheerio
-
       - name: Kjør agent
         run: node agent/run.js
         env:
