@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL som skal analyseres (inkl. https://)'
+        description: 'URL for analyse (inkl. https://)'
         required: true
 
 jobs:
@@ -35,3 +35,4 @@ jobs:
         with:
           name: salgsrapport
           path: SALGS-RAPPORT.txt
+``
