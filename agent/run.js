@@ -1,6 +1,6 @@
 // agent/run.js
-// Enkel konkurrent-agent uten eksterne pakker.
-// Bruker kun Node sine innebygde moduler for å hente HTML og gjøre enkel analyse.
+// Konkurrent-agent uten eksterne pakker.
+// Henter HTML, analyserer noen enkle ting og lager en selger-vennlig rapport med konkrete eksempler.
 
 const fs = require('fs');
 const http = require('http');
@@ -59,47 +59,55 @@ function fetchHTML(urlStr, redirects = 0) {
 /**
  * Gjet hovednøkkelord: plukk noe fra <title> eller <h1>
  */
-function guessMainKeyword(html) {
+function guessMainKeyword(html, fallbackUrl) {
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
 
   let source =
     (h1Match && h1Match[1]) ||
     (titleMatch && titleMatch[1]) ||
-    'din tjeneste';
+    fallbackUrl.replace(/^https?:\/\//, '').split('/')[0];
 
   source = source.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // Fjern veldig korte ord som ofte er "Velkommen til", "Din", etc.
   const words = source.split(' ').filter((w) => w.length > 2);
   if (!words.length) return 'din tjeneste';
 
-  // Ta de 2 første ordene som hovedfrase
   return words.slice(0, 2).join(' ');
 }
 
 /**
- * Estimer "kontrastrisiko" ved å se etter lyse farger/grå-tekstindikatorer.
- * (Ikke perfekt, men gir oss et salgsargument når det er mye lys tekst.)
+ * Finn potensielle lav-kontrast-eksempler (klasser/farger)
  */
-function estimateContrastRisk(html) {
-  const patterns = [
-    /color:\s*#ccc/gi,
-    /color:\s*#ddd/gi,
-    /color:\s*#eee/gi,
-    /color:\s*#999/gi,
-    /color:\s*#aaa/gi,
-    /class="[^"]*(text-muted|text-gray-300|text-gray-400)[^"]*"/gi
-  ];
+function findContrastExamples(html) {
+  const examples = [];
 
-  let hits = 0;
-  for (const re of patterns) {
-    const matches = html.match(re);
-    if (matches) hits += matches.length;
+  // Look for Tailwind-aktige klasser
+  const classPattern =
+    /class="([^"]*(text-gray-300|text-gray-200|text-gray-400|text-slate-300|text-muted)[^"]*)"/gi;
+  let m;
+  while ((m = classPattern.exec(html)) !== null) {
+    if (examples.length >= 5) break;
+    examples.push(`klasse: ${m[2]} (i ${m[1].slice(0, 60)}...)`);
   }
 
-  if (hits > 15) return 'høy';
-  if (hits > 0) return 'middels';
+  // Look for inline color styles
+  const stylePattern =
+    /style="[^"]*color:\s*(#[0-9a-fA-F]{3,6}|rgba?\([^)]*\))[^"]*"/gi;
+  while ((m = stylePattern.exec(html)) !== null) {
+    if (examples.length >= 5) break;
+    examples.push(`fargekode: ${m[1]}`);
+  }
+
+  return examples;
+}
+
+/**
+ * Estimer "kontrastrisiko"
+ */
+function estimateContrastRisk(contrastExamples) {
+  if (contrastExamples.length > 5) return 'høy';
+  if (contrastExamples.length > 0) return 'middels';
   return 'lav';
 }
 
@@ -114,7 +122,6 @@ function analyseHtml(html) {
   const textOnly = noScripts.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
   const textLength = textOnly.trim().length;
 
-  // overskrifter
   const headingMatches =
     noScripts.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/gi) || [];
   const headingsText = headingMatches
@@ -136,9 +143,11 @@ function analyseHtml(html) {
     /type=['"]application\/ld\+json['"]/.test(noScripts.toLowerCase());
 
   const veryLowText = textLength < 1500;
-  const contrastRisk = estimateContrastRisk(html);
 
-  // ===== Scorer (enkle regler, 0–100) =====
+  const contrastExamples = findContrastExamples(html);
+  const contrastRisk = estimateContrastRisk(contrastExamples);
+
+  // ===== Scorer =====
   let seoScore = 70;
   if (textLength < 3000) seoScore -= 10;
   if (!hasServiceWords) seoScore -= 10;
@@ -165,6 +174,7 @@ function analyseHtml(html) {
     hasSchema,
     veryLowText,
     contrastRisk,
+    contrastExamples,
     seoScore,
     aiScore,
     uuScore,
@@ -180,7 +190,6 @@ function buildRankingSection(mainKeyword, analysis) {
 
   const rows = [];
 
-  // Søkeord 1: hovedtjeneste + område
   rows.push({
     term: `${mainKeyword} i ditt område`,
     reason: [
@@ -188,106 +197,166 @@ function buildRankingSection(mainKeyword, analysis) {
       !hasSchema ? 'ingen strukturert informasjon til Google' : null
     ]
       .filter(Boolean)
-      .join(', ') || 'moderat konkurranse og begrenset innhold'
+      .join(', ') || 'begrenset innhold og sterk konkurranse'
   });
 
-  // Søkeord 2: hovedtjeneste + pris
   rows.push({
     term: `${mainKeyword} pris`,
     reason:
-      'ingen egne sider eller innhold som svarer på pris/spørsmål rundt kostnad'
+      'ingen tydelig informasjon eller egne seksjoner som svarer på pris og hva som er inkludert'
   });
 
-  // Søkeord 3: hovedtjeneste som "beste"
   rows.push({
     term: `beste ${mainKeyword}`,
     reason: [
-      !hasFAQ ? 'mangler FAQ' : null,
-      !hasSchema ? 'ingen strukturert data for anmeldelser/innhold' : null
+      !hasFAQ ? 'mangler spørsmål/svar-innhold (FAQ)' : null,
+      !hasSchema ? 'ingen strukturert data (anmeldelser/tjenester)' : null
     ]
       .filter(Boolean)
-      .join(', ') || 'lite innhold som bygger faglig tyngde og tillit'
+      .join(', ') || 'lite innhold som bygger troverdighet og faglig tyngde'
   });
 
-  let section = `Hvorfor nettsiden deres rangerer dårlig nå\n`;
-  section += `Dette er vår vurdering av hvor vanskelig det er for dere å vinne viktige søk (basert på innholdet på nettsiden, ikke faktiske rangeringstall):\n\n`;
-
-  section += `Søkeord\tForventet synlighet\tHvorfor\n`;
+  let section = `## Hvorfor nettsiden deres rangerer dårlig nå\n`;
+  section += `Dette er en vurdering basert på innholdet på nettsiden (ikke faktiske rangeringstall):\n\n`;
+  section += `Søkeord | Forventet synlighet | Hvorfor\n`;
+  section += `--- | --- | ---\n`;
   rows.forEach((row) => {
-    section += `${row.term}\tSvak\t${row.reason}\n`;
+    section += `${row.term} | Svak | ${row.reason}\n`;
   });
 
   return section.trim();
 }
 
 /**
- * Bygg rapporttekst (nå med litt mer dynamikk basert på analyse)
+ * Bygg rapporttekst (med overskrifter og punktlister i "markdown"-stil)
  */
-function buildReport(url, scores, analysis) {
+function buildReport(url, scores, analysis, html) {
   const { seoScore, aiScore, uuScore } = scores;
-  const { contrastRisk, veryLowText } = analysis;
+  const { contrastRisk, veryLowText, contrastExamples, textLength } = analysis;
 
-  const mainKeyword = guessMainKeyword(url); // fallback til URL hvis title/h1 ikke ble funnet i analyseHtml
-
+  const mainKeyword = guessMainKeyword(html, url);
   const rankingSection = buildRankingSection(mainKeyword, analysis);
 
-  const kontrastSetning =
-    contrastRisk === 'høy'
-      ? 'Nettsiden har flere områder med veldig lys/grå tekst, som kan være vanskelig å lese for mange brukere.'
-      : contrastRisk === 'middels'
-      ? 'Noe av teksten fremstår ganske lys, og kan være utfordrende å lese for enkelte brukere.'
-      : 'Teksten fremstår ikke som åpenbart vanskelig å lese ut fra en automatisk sjekk.';
-
   const liteTekstSetning = veryLowText
-    ? 'Det er relativt lite forklarende tekst på siden.'
-    : 'Det finnes en del tekst på siden, men den kunne vært mer forklarende for nye besøkende.';
+    ? '- Relativt lite forklarende tekst på siden.'
+    : '- En del tekst, men mye av den forklarer lite for nye besøkende.';
+
+  let kontrastSetning;
+  if (contrastRisk === 'høy') {
+    kontrastSetning =
+      '- Høy risiko for dårlig lesbarhet (mye lys/grå tekst mot lys bakgrunn).';
+  } else if (contrastRisk === 'middels') {
+    kontrastSetning =
+      '- Noe risiko for dårlig lesbarhet (flere lyse tekststiler brukt).';
+  } else {
+    kontrastSetning = '- Ingen åpenbar høy kontrastrisiko i automatisk sjekk.';
+  }
+
+  const kontrastEksemplerTekst =
+    contrastExamples.length > 0
+      ? contrastExamples
+          .slice(0, 3)
+          .map((e) => `  - Eksempel: ${e}`)
+          .join('\n')
+      : '  - Fantes ingen tydelige eksempler i automatisk sjekk.';
 
   return `
-Konkurrentanalyse – Kort vurdering
-Nettside: ${url}
+# Konkurrentanalyse – Kort vurdering
+
+**Nettside:** ${url}
 
 Vi har tatt en rask sjekk av nettsiden deres. Her er det viktigste:
 
-1. Google forstår ikke helt hva de driver med
-${liteTekstSetning} Google får dermed begrenset informasjon om hva dere faktisk tilbyr.
-Hva betyr det?
+---
+
+## 1. Google forstår ikke helt hva dere driver med
+
+${liteTekstSetning}
+- Google får dermed begrenset informasjon om hva dere faktisk tilbyr.
+- Overskriftene sier lite om tjenester og innhold: ${
+    analysis.hasServiceWords ? 'Noen tjeneste-ord funnet.' : 'ingen tydelige "tjenester"-overskrifter funnet.'
+  }
+
+**Hva betyr det?**
 - Dårligere synlighet i søk
 - Vanskeligere å bli funnet av nye kunder
 - Dere taper oppdrag selv om dere kan være faglig sterke
 
-2. Kundene får lite forklaring på tjenestene
+---
+
+## 2. Kundene får lite forklaring på tjenestene
+
 Siden ser pen ut, men forklarer lite:
 - hva tjenestene går ut på
 - hvordan dere jobber
 - hva kunder kan forvente
-Hva betyr det?
-Folk forstår ikke helt hva de får, blir usikre og velger ofte en annen leverandør.
 
-3. Siden fungerer ikke helt for alle brukere
+**Hva betyr det?**
+- Folk forstår ikke helt hva de får
+- Mange blir usikre
+- Flere velger en annen leverandør som forklarer bedre
+
+---
+
+## 3. Siden fungerer ikke helt for alle brukere
+
 ${kontrastSetning}
-Hva betyr det?
-Noen kunder får problemer med å bruke siden, og Google trekker poeng for sider som ikke er godt tilpasset alle.
+**Konkrete tegn på potensielt dårlig kontrast:**
+${kontrastEksemplerTekst}
 
-4. De dukker trolig ikke opp i AI-søk (ChatGPT, Bing, Google AI)
-Nettsiden mangler tydelig spør–og–svar-innhold (FAQ) og strukturert informasjon som AI-verktøy trenger.
-Hva betyr det?
-Når folk spør ChatGPT om “beste ${mainKeyword} i sitt område”, er sjansen liten for at dere blir nevnt.
+**Hva betyr det?**
+- Noen kunder får problemer med å lese og bruke siden
+- Google trekker poeng for sider som ikke er godt tilpasset alle
 
-5. Viktige poenger drukner litt
-De viktigste fordelene og argumentene deres kommer ikke tydelig nok frem i innholdet.
-Hva betyr det?
-Kundene overser mye av det som egentlig gjør dere gode, og det gir færre henvendelser.
+---
 
-Score (estimat, 0–100):
-- SEO / Google-synlighet: ${seoScore}/100
-- AI-synlighet: ${aiScore}/100
-- Brukeropplevelse: ${uuScore}/100
+## 4. De dukker trolig ikke opp i AI-søk (ChatGPT, Bing, Google AI)
+
+Nettsiden mangler:
+- tydelig spør–og–svar-innhold (FAQ): ${analysis.hasFAQ ? 'ja, noe finnes.' : 'nei, ingenting funnet.'}
+- strukturert informasjon (schema.org): ${analysis.hasSchema ? 'ja, noe finnes.' : 'nei, ingenting funnet.'}
+
+**Hva betyr det?**
+- Når folk spør ChatGPT om “beste ${mainKeyword} i sitt område”, er sjansen liten for at dere blir nevnt.
+- AI-verktøyene finner rett og slett ikke nok informasjon til å anbefale dere.
+
+---
+
+## 5. Viktige poenger drukner litt
+
+- Mye av teksten fokuserer på overflate, lite på kundens praktiske spørsmål.
+- Få tydelige avsnitt som sier “dette gjør vi, for hvem, og slik hjelper vi dere”.
+
+**Hva betyr det?**
+- Kundene overser mye av det som egentlig gjør dere gode
+- Færre tar kontakt enn dere kunne hatt med tydeligere innhold
+
+---
+
+## Score (estimat, 0–100)
+
+> Basert på tekstmengde (${textLength} tegn), struktur, FAQ og tekniske signaler fra siden.
+
+- **SEO / Google-synlighet:** ${seoScore}/100  
+- **AI-synlighet:** ${aiScore}/100  
+- **Brukeropplevelse:** ${uuScore}/100  
+
+---
 
 ${rankingSection}
 
-Kort fortalt:
-Konkurrenten ser grei ut, men Google forstår dem ikke godt nok, AI finner dem ikke,
-og mange kunder overser viktig informasjon. Dette kan dere lett gjøre bedre.
+---
+
+## Kort fortalt
+
+Konkurrenten ser grei ut, men:
+
+- Google forstår dem ikke godt nok  
+- AI (ChatGPT, Bing, Google AI) finner dem ikke  
+- Mange kunder overser viktig informasjon  
+- Siden er ikke like lett å lese og forstå som den kunne vært  
+
+**Dette er ting dere lett kan gjøre bedre – og som vil gi dere et klart fortrinn.**
 `.trim() + '\n';
 }
 
@@ -305,7 +374,7 @@ og mange kunder overser viktig informasjon. Dette kan dere lett gjøre bedre.
       uuScore: analysis.uuScore
     };
 
-    const report = buildReport(targetUrl, scores, analysis);
+    const report = buildReport(targetUrl, scores, analysis, html);
 
     fs.writeFileSync('SALGS-RAPPORT.txt', report, 'utf8');
     console.log('SALGS-RAPPORT.txt generert ✅');
