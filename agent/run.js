@@ -1,11 +1,6 @@
 // agent/run.js
-// Konkurrent-agent uten eksterne pakker.
-// Gjør enkel HTML-analyse og genererer en selger-vennlig rapport
-// med konkrete funn i formatet:
-//
-// 1) [Kort problemformulering]
-// - [konkrete funn]
-// → [konsekvens for synlighet / kunder]
+// Enkel konkurrent-agent uten eksterne pakker.
+// Analysere HTML på 5-6 klassiske feil og generer en selger-vennlig rapport.
 
 const fs = require('fs');
 const http = require('http');
@@ -31,7 +26,7 @@ function fetchHTML(urlStr, redirects = 0) {
     let url;
     try {
       url = new URL(urlStr);
-    } catch (e) {
+    } catch {
       return reject(new Error('Ugyldig URL'));
     }
 
@@ -61,7 +56,7 @@ function fetchHTML(urlStr, redirects = 0) {
 }
 
 /**
- * Gjet hovednøkkelord fra <title>/<h1> eller domenenavn
+ * Gjet hovednøkkelord (for eksempelsøk)
  */
 function guessMainKeyword(html, urlStr) {
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
@@ -75,7 +70,6 @@ function guessMainKeyword(html, urlStr) {
   source = source.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   const words = source.split(' ').filter((w) => w.length > 2);
   if (!words.length) return 'deres tjeneste';
-
   return words.slice(0, 2).join(' ');
 }
 
@@ -111,7 +105,7 @@ function estimateContrastRisk(examples) {
 }
 
 /**
- * Analyse av HTML
+ * Analyser HTML for klassiske feil
  */
 function analyseHtml(html) {
   const noScripts = html
@@ -151,6 +145,15 @@ function analyseHtml(html) {
   const contrastExamples = findContrastExamples(html);
   const contrastRisk = estimateContrastRisk(contrastExamples);
 
+  // grov SEO-score
+  let seoScore = 100;
+  if (!hasSchema) seoScore -= 20;
+  if (veryLowText) seoScore -= 20;
+  if (!hasServiceWords) seoScore -= 20;
+
+  // clamp
+  seoScore = Math.max(0, Math.min(100, seoScore));
+
   return {
     textLength,
     hasServiceWords,
@@ -160,181 +163,227 @@ function analyseHtml(html) {
     contrastExamples,
     contrastRisk,
     linkCount,
-    navPresent
+    navPresent,
+    seoScore
   };
 }
 
+function seoLabel(score) {
+  if (score >= 80) return 'høy';
+  if (score >= 50) return 'middels';
+  return 'svak';
+}
+
 /**
- * Bygg liste over problemer (dynamisk)
+ * Bygg "Realistisk rangering"-seksjon (estimat, ikke ekte SERP)
  */
-function buildIssues(url, analysis, html) {
-  const issues = [];
-  const mainKeyword = guessMainKeyword(html, url);
+function buildRankingSection(mainKeyword, seoScore) {
+  // vi bruker ikke ekte SERP, bare estimerer synlighet
+  const synlighet =
+    seoScore >= 80
+      ? 'Trolig synlig i mange relevante søk'
+      : seoScore >= 50
+      ? 'Trolig synlig på noen søk, men taper mot konkurrenter'
+      : 'Trolig svak synlighet på viktige søk';
+
+  const rows = [
+    {
+      term: `${mainKeyword} i ditt område`,
+      why:
+        seoScore < 80
+          ? 'lite forklarende innhold og manglende strukturert data'
+          : 'mangler fortsatt tydelig faglig dybde sammenlignet med toppaktørene'
+    },
+    {
+      term: `${mainKeyword} pris`,
+      why: 'ingen tydelig seksjon som svarer på pris og hva som er inkludert'
+    },
+    {
+      term: `beste ${mainKeyword}`,
+      why: 'lite innhold som bygger faglig tyngde, anmeldelser eller kundehistorier'
+    }
+  ];
+
+  let out = '';
+  out += `Realistisk rangering i Google for nettstedet (basert på innholdet på siden, ikke faktiske målinger)\n`;
+  out += `Søkeord\tForventet synlighet\tHvorfor\n`;
+  rows.forEach((r) => {
+    const forventet =
+      seoScore >= 80 ? 'Middels–god' : seoScore >= 50 ? 'Middels–svak' : 'Svak';
+    out += `${r.term}\t${forventet}\t${r.why}\n`;
+  });
+  out += `\nNettsiden rangerer trolig svakere enn den kunne på bransjesøk som for eksempel "${mainKeyword} i ditt område", "beste ${mainKeyword}" og "${mainKeyword} pris".\n`;
+
+  return out;
+}
+
+/**
+ * Bygg "De største problemene"-seksjon basert på faktiske funn
+ */
+function buildProblemsSection(analysis) {
   const {
     textLength,
+    hasSchema,
     hasServiceWords,
     hasFAQ,
-    hasSchema,
-    veryLowText,
-    contrastExamples,
     contrastRisk,
-    linkCount,
-    navPresent
+    contrastExamples,
+    navPresent,
+    linkCount
   } = analysis;
+
+  const problems = [];
 
   // 1) Dårlig SEO
   const seoBullets = [];
-  if (!hasSchema) seoBullets.push('Siden mangler strukturert data (schema.org).');
+  if (!hasSchema) seoBullets.push('Mangler strukturert data (schema.org).');
   if (textLength < 3000)
-    seoBullets.push(
-      `Det er lite forklarende tekst (anslagsvis ${textLength} tegn synlig tekst).`
-    );
+    seoBullets.push(`Lite forklarende tekst (ca. ${textLength} tegn synlig tekst).`);
   if (!hasServiceWords)
-    seoBullets.push(
-      'Overskriftene sier lite om konkrete tjenester eller tilbud.'
-    );
-
+    seoBullets.push('Få tydelige tjeneste-overskrifter som treffer søkeord målgruppen bruker.');
   if (seoBullets.length) {
-    issues.push({
-      title: 'Dårlig SEO: Google forstår ikke innholdet',
+    problems.push({
+      title: '1) Dårlig SEO – Google forstår ikke innholdet',
       bullets: seoBullets,
       impacts: [
-        'Lavere synlighet i Google, spesielt på søk der kunder bruker tjenestenavn og sted.',
+        'Lavere synlighet i Google på viktige bransjesøk.',
         'Kunder vil i mindre grad finne dere når de søker etter det dere faktisk tilbyr.'
       ]
     });
   }
 
-  // 2) Lite forklaring av tjenester (brukeropplevelse)
-  const uxBullets = [];
-  if (veryLowText)
-    uxBullets.push(
-      'Nettsiden har generelt lite tekst som forklarer hva dere gjør og hvordan dere jobber.'
+  // 2) Brudd på UU-krav (universell utforming) – indikatorer
+  const uuBullets = [];
+  if (contrastRisk === 'høy')
+    uuBullets.push('Svak kontrast: mange lyse/bleke tekster som kan være vanskelig å lese.');
+  if (contrastRisk === 'middels')
+    uuBullets.push('Noe risiko for svak kontrast, med flere lyse tekststiler.');
+  if (contrastExamples.length) {
+    uuBullets.push('Eksempler på potensielt problematiske tekststiler:');
+    contrastExamples.slice(0, 3).forEach((ex) => uuBullets.push(`- ${ex}`));
+  }
+  if (uuBullets.length) {
+    problems.push({
+      title: '2) Brudd på UU-krav (universell utforming) – indikasjoner',
+      bullets: uuBullets,
+      impacts: [
+        'Noen brukere vil ha problemer med å lese innholdet.',
+        'Gir risiko for klager/pålegg og svekket inntrykk av profesjonalitet.'
+      ]
+    });
+  }
+
+  // 3) Lav PageSpeed – kun grov indikasjon via HTML-størrelse
+  const pageSpeedBullets = [];
+  if (textLength > 8000)
+    pageSpeedBullets.push(
+      'Mye innhold lastes på én side, noe som kan gjøre siden tung på mobil.'
+    );
+  if (!pageSpeedBullets.length && textLength > 0 && textLength < 8000) {
+    // ikke sterkt grunnlag, la være å ta med punkt 3
+  } else if (pageSpeedBullets.length) {
+    problems.push({
+      title: '3) Lav PageSpeed – treg side (indikasjon)',
+      bullets: pageSpeedBullets,
+      impacts: [
+        'Kunder mister tålmodigheten hvis siden oppleves treg, spesielt på mobil.',
+        'Google prioriterer raske sider, så treghet kan gi færre klikk og henvendelser.'
+      ]
+    });
+  }
+
+  // 4) Kunder får ikke med seg viktig innhold
+  const contentBullets = [];
+  if (textLength < 2000)
+    contentBullets.push(
+      'Lite overordnet innhold som forklarer hvem dere er, hva dere gjør og hvorfor kunden skal velge dere.'
     );
   if (!hasServiceWords)
-    uxBullets.push(
-      'Det er få tydelige seksjoner eller overskrifter som beskriver tjenester eller prosess.'
+    contentBullets.push(
+      'Mangler tydelige seksjoner som løfter frem de viktigste tjenestene.'
     );
-
-  if (uxBullets.length) {
-    issues.push({
-      title: 'Kundene får lite forklaring på tjenestene',
-      bullets: uxBullets,
+  if (contrastRisk === 'høy' || contrastRisk === 'middels')
+    contentBullets.push('Lesbarheten påvirkes av svak kontrast enkelte steder.');
+  if (contentBullets.length) {
+    problems.push({
+      title: '4) Kunder får ikke med seg viktig innhold',
+      bullets: contentBullets,
       impacts: [
-        'Besøkende forstår ikke helt hva de får, og blir usikre.',
-        'Flere vil velge en konkurrent som forklarer tydeligere.'
+        'Tapte salgspunkter – budskapene deres kommer ikke tydelig nok frem.',
+        'Færre tar kontakt enn dere kunne hatt med tydeligere og mer lesbart innhold.'
       ]
     });
   }
 
-  // 3) Svak synlighet i AI-søk
-  const aiBullets = [];
+  // 5) Ingen FAQ eller LLM-optimalisering (AEO)
+  const aeoBullets = [];
   if (!hasFAQ)
-    aiBullets.push('Vi fant ingen tydelig FAQ eller spørsmål/svar-seksjon.');
+    aeoBullets.push('Ingen FAQ eller tydelig spørsmål/svar-seksjon som kan brukes i AI-svar.');
   if (!hasSchema)
-    aiBullets.push(
-      'Vi fant ingen strukturert informasjon (schema.org) som AI-verktøy kan bruke.'
+    aeoBullets.push(
+      'Ingen strukturert data som gjør det lett for AI-tjenester å forstå hvem dere er og hva dere tilbyr.'
     );
-
-  if (aiBullets.length) {
-    issues.push({
-      title: 'Svak synlighet i AI-søk (ChatGPT, Bing, Google AI)',
-      bullets: aiBullets,
+  if (aeoBullets.length) {
+    problems.push({
+      title: '5) Ingen FAQ eller LLM-optimalisering (AEO)',
+      bullets: aeoBullets,
       impacts: [
-        `Når folk spør etter "beste ${mainKeyword} i området" i AI-verktøy, er det lite som tyder på at dere blir nevnt.`,
-        'AI-verktøyene finner for lite konkret informasjon til å anbefale dere.'
+        'Nettsiden dukker i liten grad opp i AI-genererte svar (ChatGPT, Bing, Google AI).',
+        'Konkurrenter som har FAQ og strukturert data får et forsprang i nye søkekanaler.'
       ]
     });
   }
 
-  // 4) Kontrast og lesbarhet
-  const kontrastBullets = [];
-  if (contrastRisk === 'høy')
-    kontrastBullets.push(
-      'Automatisk sjekk tyder på høy risiko for svak kontrast (mye lys/grå tekst).'
-    );
-  if (contrastRisk === 'middels')
-    kontrastBullets.push(
-      'Vi fant flere eksempler på lyse tekststiler som kan være vanskelige å lese.'
-    );
-  if (contrastExamples.length) {
-    kontrastBullets.push(
-      'Eksempler på potensielt svak kontrast:'
-    );
-    contrastExamples.slice(0, 3).forEach((ex) => {
-      kontrastBullets.push(`  - ${ex}`);
-    });
-  }
-
-  if (kontrastBullets.length) {
-    issues.push({
-      title: 'Kontrast og lesbarhet er sannsynligvis et problem',
-      bullets: kontrastBullets,
-      impacts: [
-        'Noen kunder vil slite med å lese viktig innhold.',
-        'Google vurderer lesbarhet som en del av brukeropplevelsen, noe som kan trekke ned.'
-      ]
-    });
-  }
-
-  // 5) Struktur og navigasjon
-  const navBullets = [];
-  if (!navPresent)
-    navBullets.push('Vi fant ingen tydelig <nav>-struktur for hovedmeny.');
-  if (linkCount < 10)
-    navBullets.push(
-      `Det er få lenker totalt på siden (omtrent ${linkCount}), noe som tyder på lite intern navigasjon.`
-    );
-
-  if (navBullets.length) {
-    issues.push({
-      title: 'Struktur og navigasjon kunne vært tydeligere',
-      bullets: navBullets,
-      impacts: [
-        'Besøkende kan få vanskeligere for å finne det de leter etter.',
-        'Google får mindre hjelp til å forstå hvilke sider/tema som er viktigst.'
-      ]
-    });
-  }
-
-  return { issues, mainKeyword };
+  return problems;
 }
 
 /**
- * Bygg selger-rapport etter ønsket mal
+ * Bygg hele rapporten
  */
-function buildReport(url, analysis, html) {
-  const { issues, mainKeyword } = buildIssues(url, analysis, html);
+function buildReport(url, html, analysis) {
+  const { seoScore } = analysis;
+  const label = seoLabel(seoScore);
+  const mainKeyword = guessMainKeyword(html, url);
+  const problems = buildProblemsSection(analysis);
+  const ranking = buildRankingSection(mainKeyword, seoScore);
 
   let out = '';
-  out += `Konkurrentanalyse – Kort vurdering\n`;
-  out += `Nettside: ${url}\n\n`;
-  out += `Vi har gjort en enkel automatisk gjennomgang av nettsiden deres. Her er de viktigste funnene:\n\n`;
 
-  if (!issues.length) {
-    out += `Vi fant ingen åpenbare alvorlige problemer basert på automatisk sjekk, men det er fortsatt rom for forbedring i innhold og synlighet.\n`;
-    return out;
-  }
+  // Topp
+  out += `Din side (${url})\n`;
+  out += `har fått en SEO-score på\n`;
+  out += `${seoScore} / 100 (${label})\n\n`;
 
-  issues.forEach((issue, idx) => {
-    out += `${idx + 1}) ${issue.title}\n`;
-    issue.bullets.forEach((b) => {
-      out += `- ${b}\n`;
+  out += `${ranking}\n\n`;
+
+  out += `Hvorfor ${url} scorer dårlig i Google\n\n`;
+  out += `De største problemene\n`;
+
+  problems.forEach((p) => {
+    out += `\n${p.title}\n`;
+    p.bullets.forEach((b) => {
+      out += `* ${b}\n`;
     });
-    if (issue.impacts && issue.impacts.length) {
-      issue.impacts.forEach((i) => {
-        out += `→ ${i}\n`;
-      });
-    }
-    out += `\n`;
+    p.impacts.forEach((i) => {
+      out += `→ ${i}\n`;
+    });
   });
 
-  out += `Oppsummert:\n`;
-  out += `- Nettsiden gir et greit visuelt inntrykk, men har svakheter på innhold og struktur.\n`;
-  out += `- Google og AI-tjenester får for lite konkret informasjon om hva dere tilbyr.\n`;
-  out += `- Mange kunder vil ha problemer med både å finne dere og å forstå hvorfor de skal velge dere.\n`;
+  out += `\n\nHva vi fant\n`;
+  out += `Dette nettstedet har flere svakheter som påvirker:\n`;
+  out += `* synlighet i Google\n`;
+  out += `* brukeropplevelse\n`;
+  out += `* troverdighet\n`;
+  out += `* konverteringer (hvor mange som faktisk tar kontakt)\n`;
+  out += `* risiko for brudd på norsk tilgjengelighetslov (UU)\n\n`;
 
-  out += `\nDette er ting det er fullt mulig å forbedre, og som vil gjøre det enklere å bli valgt som leverandør.\n`;
+  out += `Hvordan vi kan hjelpe deg\n`;
+  out += `Vi leverer:\n`;
+  out += `* Raskere sider\n`;
+  out += `* Bedre SEO\n`;
+  out += `* Bedre universell utforming (UU)\n`;
+  out += `* Strukturert data + AI-optimalisering\n`;
+  out += `* Bedre konvertering og mer profesjonell presentasjon\n`;
 
   return out;
 }
@@ -347,8 +396,8 @@ function buildReport(url, analysis, html) {
     console.log('Henter HTML fra:', targetUrl);
     const html = await fetchHTML(targetUrl);
     const analysis = analyseHtml(html);
+    const report = buildReport(targetUrl, html, analysis);
 
-    const report = buildReport(targetUrl, analysis, html);
     fs.writeFileSync('SALGS-RAPPORT.txt', report, 'utf8');
     console.log('SALGS-RAPPORT.txt generert ✅');
   } catch (err) {
