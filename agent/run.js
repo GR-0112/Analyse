@@ -1,5 +1,6 @@
 const fs = require('fs');
 const cheerio = require('cheerio');
+const fetch = require('node-fetch');
 
 const url = process.env.TARGET_URL;
 
