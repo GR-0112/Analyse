@@ -1,6 +1,6 @@
 // agent/run.js
 // Enkel konkurrent-agent uten eksterne pakker.
-// Analysere HTML på 5-6 klassiske feil og generer en selger-vennlig rapport.
+// Analysere HTML på klassiske feil og generere en selger-vennlig rapport.
 
 const fs = require('fs');
 const http = require('http');
@@ -56,7 +56,7 @@ function fetchHTML(urlStr, redirects = 0) {
 }
 
 /**
- * Gjet hovednøkkelord (for eksempelsøk)
+ * Gjet hovednøkkelord (tjeneste)
  */
 function guessMainKeyword(html, urlStr) {
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
@@ -71,6 +71,33 @@ function guessMainKeyword(html, urlStr) {
   const words = source.split(' ').filter((w) => w.length > 2);
   if (!words.length) return 'deres tjeneste';
   return words.slice(0, 2).join(' ');
+}
+
+/**
+ * Gjet lokasjon (f.eks. Raufoss) ut fra tekst som "2830 Raufoss"
+ */
+function guessLocation(html) {
+  const lower = html.toLowerCase();
+
+  // postnummer + sted
+  const match = lower.match(/\b(\d{4})\s+([a-zæøå\- ]{2,})\b/);
+  if (match) {
+    const sted = match[2].trim();
+    if (
+      sted.length > 2 &&
+      !sted.includes('norge') &&
+      !sted.includes('norway')
+    ) {
+      // enkel kapitalisering
+      return sted
+        .split(' ')
+        .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+        .join(' ');
+    }
+  }
+
+  // fallback
+  return 'ditt område';
 }
 
 /**
@@ -95,6 +122,15 @@ function findContrastExamples(html) {
     examples.push(`fargekode: ${s[1]}`);
   }
 
+  // se også etter body { color: ... } i inline <style>
+  const styleBlocks = html.match(/<style[^>]*>([\s\S]*?)<\/style>/gi) || [];
+  for (const block of styleBlocks) {
+    const bodyMatch = block.match(/body\s*{[^}]*color:\s*(#[0-9a-fA-F]{3,6})/i);
+    if (bodyMatch) {
+      examples.push(`body-tekstfarge: ${bodyMatch[1]} definert i CSS`);
+    }
+  }
+
   return examples;
 }
 
@@ -105,7 +141,7 @@ function estimateContrastRisk(examples) {
 }
 
 /**
- * Analyser HTML for klassiske feil
+ * Enkel HTML-analyse
  */
 function analyseHtml(html) {
   const noScripts = html
@@ -133,7 +169,7 @@ function analyseHtml(html) {
     /<details[^>]*>[\s\S]*?<summary[^>]*>/i.test(noScripts);
 
   const hasSchema =
-    /type=['"]application\/ld\+json['"]/.test(noScripts.toLowerCase());
+    /type=['"]application\/ld\+json['"]/.test(html.toLowerCase());
 
   const veryLowText = textLength < 1500;
 
@@ -145,13 +181,12 @@ function analyseHtml(html) {
   const contrastExamples = findContrastExamples(html);
   const contrastRisk = estimateContrastRisk(contrastExamples);
 
-  // grov SEO-score
+  // SEO-score
   let seoScore = 100;
   if (!hasSchema) seoScore -= 20;
   if (veryLowText) seoScore -= 20;
   if (!hasServiceWords) seoScore -= 20;
 
-  // clamp
   seoScore = Math.max(0, Math.min(100, seoScore));
 
   return {
@@ -170,55 +205,55 @@ function analyseHtml(html) {
 
 function seoLabel(score) {
   if (score >= 80) return 'høy';
-  if (score >= 50) return 'middels';
+  if (score >= 60) return 'middels';
+  if (score >= 40) return 'middels / svak';
   return 'svak';
 }
 
 /**
- * Bygg "Realistisk rangering"-seksjon (estimat, ikke ekte SERP)
+ * "Realistisk rangering"-tabell (ASCII)
  */
-function buildRankingSection(mainKeyword, seoScore) {
-  // vi bruker ikke ekte SERP, bare estimerer synlighet
-  const synlighet =
-    seoScore >= 80
-      ? 'Trolig synlig i mange relevante søk'
-      : seoScore >= 50
-      ? 'Trolig synlig på noen søk, men taper mot konkurrenter'
-      : 'Trolig svak synlighet på viktige søk';
-
+function buildRankingSection(mainKeyword, location, seoScore) {
   const rows = [
     {
-      term: `${mainKeyword} i ditt område`,
+      term: `${mainKeyword} ${location}`,
       why:
-        seoScore < 80
-          ? 'lite forklarende innhold og manglende strukturert data'
-          : 'mangler fortsatt tydelig faglig dybde sammenlignet med toppaktørene'
+        seoScore >= 80
+          ? 'godt nok innhold, men fortsatt konkurranse'
+          : seoScore >= 50
+          ? 'begrenset innhold og strukturert data'
+          : 'lite forklarende innhold og manglende strukturert data'
     },
     {
-      term: `${mainKeyword} pris`,
+      term: `${mainKeyword} pris ${location}`,
       why: 'ingen tydelig seksjon som svarer på pris og hva som er inkludert'
     },
     {
-      term: `beste ${mainKeyword}`,
+      term: `beste ${mainKeyword} ${location}`,
       why: 'lite innhold som bygger faglig tyngde, anmeldelser eller kundehistorier'
     }
   ];
 
   let out = '';
-  out += `Realistisk rangering i Google for nettstedet (basert på innholdet på siden, ikke faktiske målinger)\n`;
-  out += `Søkeord\tForventet synlighet\tHvorfor\n`;
+  out += `Realistisk rangering i Google for nettstedet (basert på innholdet, ikke faktiske målinger)\n`;
+  out += `Søkeord                           | Forventet synlighet | Hvorfor\n`;
+  out += `--------------------------------- | ------------------- | ---------------------------------------------\n`;
+
   rows.forEach((r) => {
     const forventet =
       seoScore >= 80 ? 'Middels–god' : seoScore >= 50 ? 'Middels–svak' : 'Svak';
-    out += `${r.term}\t${forventet}\t${r.why}\n`;
+    const term = r.term.padEnd(33, ' ');
+    const vis = forventet.padEnd(19, ' ');
+    out += `${term} | ${vis} | ${r.why}\n`;
   });
-  out += `\nNettsiden rangerer trolig svakere enn den kunne på bransjesøk som for eksempel "${mainKeyword} i ditt område", "beste ${mainKeyword}" og "${mainKeyword} pris".\n`;
+
+  out += `\nNettsiden rangerer trolig svakere enn den kunne på bransjesøk som for eksempel "${mainKeyword} ${location}", "beste ${mainKeyword} ${location}" og "${mainKeyword} pris ${location}".\n`;
 
   return out;
 }
 
 /**
- * Bygg "De største problemene"-seksjon basert på faktiske funn
+ * Bygg "De største problemene"
  */
 function buildProblemsSection(analysis) {
   const {
@@ -227,9 +262,7 @@ function buildProblemsSection(analysis) {
     hasServiceWords,
     hasFAQ,
     contrastRisk,
-    contrastExamples,
-    navPresent,
-    linkCount
+    contrastExamples
   } = analysis;
 
   const problems = [];
@@ -238,9 +271,13 @@ function buildProblemsSection(analysis) {
   const seoBullets = [];
   if (!hasSchema) seoBullets.push('Mangler strukturert data (schema.org).');
   if (textLength < 3000)
-    seoBullets.push(`Lite forklarende tekst (ca. ${textLength} tegn synlig tekst).`);
+    seoBullets.push(
+      `Lite forklarende tekst (anslagsvis ${textLength} tegn synlig tekst).`
+    );
   if (!hasServiceWords)
-    seoBullets.push('Få tydelige tjeneste-overskrifter som treffer søkeord målgruppen bruker.');
+    seoBullets.push(
+      'Få tydelige tjeneste-overskrifter som treffer søkeord målgruppen bruker.'
+    );
   if (seoBullets.length) {
     problems.push({
       title: '1) Dårlig SEO – Google forstår ikke innholdet',
@@ -252,42 +289,46 @@ function buildProblemsSection(analysis) {
     });
   }
 
-  // 2) Brudd på UU-krav (universell utforming) – indikatorer
+  // 2) UU / kontrast
   const uuBullets = [];
   if (contrastRisk === 'høy')
-    uuBullets.push('Svak kontrast: mange lyse/bleke tekster som kan være vanskelig å lese.');
+    uuBullets.push(
+      'Svak kontrast: mange lyse/bleke tekster som kan være vanskelige å lese.'
+    );
   if (contrastRisk === 'middels')
-    uuBullets.push('Noe risiko for svak kontrast, med flere lyse tekststiler.');
+    uuBullets.push(
+      'Noe risiko for svak kontrast, med flere lyse tekststiler.'
+    );
   if (contrastExamples.length) {
-    uuBullets.push('Eksempler på potensielt problematiske tekststiler:');
-    contrastExamples.slice(0, 3).forEach((ex) => uuBullets.push(`- ${ex}`));
+    uuBullets.push('Eksempler på potensielt problematisk tekstfarge/klasse:');
+    contrastExamples.slice(0, 3).forEach((ex) => uuBullets.push(`* ${ex}`));
   }
+
   if (uuBullets.length) {
     problems.push({
-      title: '2) Brudd på UU-krav (universell utforming) – indikasjoner',
+      title: '2) Brudd på UU‑krav (indikasjoner på svak universell utforming)',
       bullets: uuBullets,
       impacts: [
         'Noen brukere vil ha problemer med å lese innholdet.',
-        'Gir risiko for klager/pålegg og svekket inntrykk av profesjonalitet.'
+        'Gir risiko for klager/pålegg og et mindre profesjonelt inntrykk.'
       ]
     });
   }
 
-  // 3) Lav PageSpeed – kun grov indikasjon via HTML-størrelse
-  const pageSpeedBullets = [];
+  // 3) Lav PageSpeed – grov indikasjon
+  const pageBullets = [];
   if (textLength > 8000)
-    pageSpeedBullets.push(
-      'Mye innhold lastes på én side, noe som kan gjøre siden tung på mobil.'
+    pageBullets.push(
+      'Mye innhold lastes på én side, noe som kan gjøre siden tung å laste på mobil.'
     );
-  if (!pageSpeedBullets.length && textLength > 0 && textLength < 8000) {
-    // ikke sterkt grunnlag, la være å ta med punkt 3
-  } else if (pageSpeedBullets.length) {
+
+  if (pageBullets.length) {
     problems.push({
       title: '3) Lav PageSpeed – treg side (indikasjon)',
-      bullets: pageSpeedBullets,
+      bullets: pageBullets,
       impacts: [
         'Kunder mister tålmodigheten hvis siden oppleves treg, spesielt på mobil.',
-        'Google prioriterer raske sider, så treghet kan gi færre klikk og henvendelser.'
+        'Google prioriterer raskere sider, så treghet kan gi færre klikk og henvendelser.'
       ]
     });
   }
@@ -303,7 +344,8 @@ function buildProblemsSection(analysis) {
       'Mangler tydelige seksjoner som løfter frem de viktigste tjenestene.'
     );
   if (contrastRisk === 'høy' || contrastRisk === 'middels')
-    contentBullets.push('Lesbarheten påvirkes av svak kontrast enkelte steder.');
+    contentBullets.push('Lesbarheten påvirkes negativt av svak kontrast enkelte steder.');
+
   if (contentBullets.length) {
     problems.push({
       title: '4) Kunder får ikke med seg viktig innhold',
@@ -315,21 +357,22 @@ function buildProblemsSection(analysis) {
     });
   }
 
-  // 5) Ingen FAQ eller LLM-optimalisering (AEO)
+  // 5) Ingen FAQ / LLM-optimalisering
   const aeoBullets = [];
   if (!hasFAQ)
-    aeoBullets.push('Ingen FAQ eller tydelig spørsmål/svar-seksjon som kan brukes i AI-svar.');
+    aeoBullets.push('Ingen FAQ eller tydelig spørsmål/svar-seksjon (FAQ) funnet.');
   if (!hasSchema)
     aeoBullets.push(
-      'Ingen strukturert data som gjør det lett for AI-tjenester å forstå hvem dere er og hva dere tilbyr.'
+      'Ingen strukturert data som gjør det lett for AI-tjenester å forstå virksomheten.'
     );
+
   if (aeoBullets.length) {
     problems.push({
       title: '5) Ingen FAQ eller LLM-optimalisering (AEO)',
       bullets: aeoBullets,
       impacts: [
         'Nettsiden dukker i liten grad opp i AI-genererte svar (ChatGPT, Bing, Google AI).',
-        'Konkurrenter som har FAQ og strukturert data får et forsprang i nye søkekanaler.'
+        'Konkurrenter som har FAQ og strukturert data vil få et forsprang i nye søkekanaler.'
       ]
     });
   }
@@ -344,18 +387,17 @@ function buildReport(url, html, analysis) {
   const { seoScore } = analysis;
   const label = seoLabel(seoScore);
   const mainKeyword = guessMainKeyword(html, url);
+  const location = guessLocation(html);
+  const ranking = buildRankingSection(mainKeyword, location, seoScore);
   const problems = buildProblemsSection(analysis);
-  const ranking = buildRankingSection(mainKeyword, seoScore);
 
   let out = '';
 
-  // Topp
   out += `Din side (${url})\n`;
-  out += `har fått en SEO-score på\n`;
+  out += `har fått en SEO‑score på\n`;
   out += `${seoScore} / 100 (${label})\n\n`;
 
   out += `${ranking}\n\n`;
-
   out += `Hvorfor ${url} scorer dårlig i Google\n\n`;
   out += `De største problemene\n`;
 
@@ -369,7 +411,7 @@ function buildReport(url, html, analysis) {
     });
   });
 
-  out += `\n\nHva vi fant\n`;
+  out += `\nHva vi fant\n`;
   out += `Dette nettstedet har flere svakheter som påvirker:\n`;
   out += `* synlighet i Google\n`;
   out += `* brukeropplevelse\n`;
@@ -382,7 +424,7 @@ function buildReport(url, html, analysis) {
   out += `* Raskere sider\n`;
   out += `* Bedre SEO\n`;
   out += `* Bedre universell utforming (UU)\n`;
-  out += `* Strukturert data + AI-optimalisering\n`;
+  out += `* Strukturert data + AI‑optimalisering\n`;
   out += `* Bedre konvertering og mer profesjonell presentasjon\n`;
 
   return out;
