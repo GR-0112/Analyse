@@ -1,5 +1,38 @@
 const fs = require('fs');
 const cheerio = require('cheerio');
+const https = require('https');
+
+// Enkel fetch-funksjon som ikke bruker node-fetch/undici
+function fetchHTML(url) {
+  return new Promise((resolve, reject) => {
+    const doRequest = (u, redirects = 0) => {
+      https
+        .get(u, (res) => {
+          // Håndter enkle redirects (301/302)
+          if (
+            res.statusCode >= 300 &&
+            res.statusCode < 400 &&
+            res.headers.location &&
+            redirects < 3
+          ) {
+            const next = res.headers.location.startsWith('http')
+              ? res.headers.location
+              : new URL(res.headers.location, u).toString();
+            return doRequest(next, redirects + 1);
+          }
+
+          let data = '';
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
+          res.on('end', () => resolve(data));
+        })
+        .on('error', (err) => reject(err));
+    };
+
+    doRequest(url);
+  });
+}
 
 const url = process.env.TARGET_URL;
 
@@ -9,55 +42,53 @@ if (!url) {
 }
 
 (async () => {
-  // Enkel fetch – Node 18 har innebygget fetch
-  const res = await fetch(url);
-  const html = await res.text();
-  const $ = cheerio.load(html);
+  try {
+    console.log('Henter HTML fra:', url);
 
-  // ===== 1. Enkle indikatorer =====
-  const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
-  const textLength = bodyText.length;
+    const html = await fetchHTML(url);
+    const $ = cheerio.load(html);
 
-  // Tjenesteindikator: antall overskrifter som ser ut som "tjenester"
-  const headings = $('h1, h2, h3').text().toLowerCase();
-  const hasServiceWords =
-    headings.includes('tjenester') ||
-    headings.includes('produkter') ||
-    headings.includes('vi tilbyr');
+    // ===== 1. Enkle indikatorer =====
+    const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
+    const textLength = bodyText.length;
 
-  // FAQ-indikator
-  const hasFAQ =
-    $('details, summary').length > 0 ||
-    $('.faq, .accordion').length > 0 ||
-    /faq|ofte stilte spørsmål/i.test(headings);
+    const headingsText = $('h1, h2, h3').text().toLowerCase();
 
-  // Schema-indikator
-  const hasSchema = $('script[type="application/ld+json"]').length > 0;
+    const hasServiceWords =
+      headingsText.includes('tjenester') ||
+      headingsText.includes('produkter') ||
+      headingsText.includes('vi tilbyr');
 
-  // Enkel "brukeropplevelse"-indikator: veldig lite tekst = dårlig
-  const veryLowText = textLength < 1500;
+    const hasFAQ =
+      $('details, summary').length > 0 ||
+      $('.faq, .accordion').length > 0 ||
+      /faq|ofte stilte spørsmål/i.test(headingsText);
 
-  // ===== 2. Enkle scorer =====
-  let seoScore = 70;
-  if (textLength < 3000) seoScore -= 10;
-  if (!hasServiceWords) seoScore -= 10;
-  if (!hasSchema) seoScore -= 10;
+    const hasSchema = $('script[type="application/ld+json"]').length > 0;
 
-  let aiScore = 70;
-  if (!hasFAQ) aiScore -= 20;
-  if (!hasSchema) aiScore -= 10;
-  if (textLength < 3000) aiScore -= 10;
+    const veryLowText = textLength < 1500;
 
-  let uuScore = 75;
-  if (veryLowText) uuScore -= 10; // lite forklarende tekst
+    // ===== 2. Enkle scorer =====
+    let seoScore = 70;
+    if (textLength < 3000) seoScore -= 10;
+    if (!hasServiceWords) seoScore -= 10;
+    if (!hasSchema) seoScore -= 10;
 
-  // Begrens scorer mellom 0 og 100
-  seoScore = Math.max(0, Math.min(100, seoScore));
-  aiScore = Math.max(0, Math.min(100, aiScore));
-  uuScore = Math.max(0, Math.min(100, uuScore));
+    let aiScore = 70;
+    if (!hasFAQ) aiScore -= 20;
+    if (!hasSchema) aiScore -= 10;
+    if (textLength < 3000) aiScore -= 10;
 
-  // ===== 3. Bygg selger-rapport =====
-  const rapport = `
+    let uuScore = 75;
+    if (veryLowText) uuScore -= 10; // lite forklarende tekst
+
+    // Begrens scorer mellom 0 og 100
+    seoScore = Math.max(0, Math.min(100, seoScore));
+    aiScore = Math.max(0, Math.min(100, aiScore));
+    uuScore = Math.max(0, Math.min(100, uuScore));
+
+    // ===== 3. Bygg selger-rapport =====
+    const rapport = `
 Konkurrentanalyse – Kort vurdering
 Nettside: ${url}
 
@@ -103,7 +134,10 @@ Konkurrenten ser grei ut, men Google forstår dem ikke, AI finner dem ikke,
 og mange kunder overser viktig informasjon. Dere kan lett gjøre dette bedre.
 `.trim() + '\n';
 
-  fs.writeFileSync('SALGS-RAPPORT.txt', rapport, 'utf8');
-  console.log('SALGS-RAPPORT.txt generert ✅');
+    fs.writeFileSync('SALGS-RAPPORT.txt', rapport, 'utf8');
+    console.log('SALGS-RAPPORT.txt generert ✅');
+  } catch (err) {
+    console.error('Feil under kjøring av agent:', err);
+    process.exit(1);
+  }
 })();
-``
